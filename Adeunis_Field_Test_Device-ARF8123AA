@@ -1,0 +1,245 @@
+// Based on https://www.thethingsnetwork.org/community/leeds-bradford/post/things-coverage-map
+const payloadByteIndex = {
+    status: 0,
+    temperature: 1,
+    gpsLatitude: 2,
+    gpsLongitude: 6,
+    gpsQuality: 10,
+    up: 11,
+    down: 12,
+    battery: 13,
+    rssi: 15,
+    snr: 16,
+};
+
+function adeunisDecoder(bytes, rxInfo, port) {
+    function Hex2Bin(hex) {
+        if (!checkHex(hex)) {
+            return 0;
+        } else {
+            return parseInt(hex, 16).toString(2).padStart(8, "0");
+        }
+    }
+    function checkHex(n) {
+        return /^[0-9A-Fa-f]{1,64}$/.test(n);
+    }
+    function checkBin(n) {
+        return /^[01]{1,64}$/.test(n);
+    }
+    function Bin2Dec(n) {
+        if (!checkBin(n)) return 0;
+        return parseInt(n, 2);
+    }
+    function Bin2Arr(str) {
+        var a = new Array(str.length);
+        for (var i = 0; i < str.length; i++) {
+            a[i] = str.toString().substr(i, 1) == "1" ? 1 : 0;
+        }
+        return a;
+    }
+    function fixNaN(i) {
+        if (isNaN(i)) {
+            return 0;
+        } else {
+            return i;
+        }
+    }
+    function Str2HexArr(s) {
+        const a = new Array(0);
+        for (let i = 0; i < s.length; i++) {
+            a.push(s[i].toString(16));
+        }
+        return a;
+    }
+    function dec2bin(dec) {
+        return (dec >>> 0).toString(2);
+    }
+
+    const payload = {};
+    const payload_decrypt_arr = Str2HexArr(bytes);
+    const payload_decrypt = payload_decrypt_arr.join("");
+
+    function parsePayload() {
+        // Enable when debugging
+        // payload.bytes = bytes
+
+        // Create object with properties pre-ordered
+        let payloadOrder = {
+            devRssi: null,
+            devSnr: null,
+            gwRssi: null,
+            gwSnr: null,
+            lat: null,
+            lon: null,
+            allGatewayPackages: null,
+            temperature: null,
+            up: null,
+            dn: null,
+            battery: null,
+        };
+
+        const str = payload_decrypt;
+        const a = payload_decrypt_arr.reduce(
+            (res, currentHex) => (res += Hex2Bin(currentHex)),
+            ""
+        );
+        const arr = Bin2Arr(a);
+
+        // Decode the first byte
+        const statusInfo = {
+            temperature: fixNaN(arr[0]),
+            trigger_acc: fixNaN(arr[1]),
+            trigger_button: fixNaN(arr[2]),
+            gps: fixNaN(arr[3]),
+            up_ctr: fixNaN(arr[4]),
+            dn_ctr: fixNaN(arr[5]),
+            battery: fixNaN(arr[6]),
+            rssiSnr: fixNaN(arr[7]),
+        };
+
+        // Start at temperature as we just read status
+        let bytesIndex = payloadByteIndex.temperature;
+
+        if (statusInfo.temperature) {
+            setTemperature(payload, bytesIndex++ * 8, arr, a);
+        }
+
+        // Get GPS
+        if (statusInfo.gps) {
+            let i = bytesIndex * 8;
+
+            // Get latitude
+            var lat_d = parseInt(str.substr(i / 4, 2));
+            i += 8;
+            var lat_m = parseInt(str.substr(i / 4, 2));
+            i += 8;
+            var lat_s = parseInt(str.substr(i / 4, 3));
+            i += 12;
+            var sign = str.substr(1 / 4, 1) == "1" ? -1 : 1;
+            i += 4;
+            payload.lat = sign * (lat_d + lat_m / 60 + lat_s / 60000);
+
+            // Get longitude
+            var lon_d = parseInt(str.substr(i / 4, 2));
+            i += 8;
+            var lon_m = parseInt(str.substr(i / 4, 2));
+            i += 8;
+            var lon_s = parseInt(str.substr(i / 4, 2));
+            i += 12;
+            if (typeof lon_s !== "number") lon_s = 0;
+            if (typeof lon_m !== "number") lon_m = 0;
+            if (typeof lon_d !== "number") lon_d = 0;
+            sign = str.substr(i / 4, 1) == "1" ? -1 : 1;
+            i += 4;
+            payload.lon = sign * (lon_d + lon_m / 60 + lon_s / 6000);
+
+            // Update byte index and skip GPS quality (+1 byte)
+            bytesIndex = bytesIndex + 4 * 2 + 1;
+        }
+
+        // List gateways
+        setGateways(payload, rxInfo);
+
+        if (statusInfo.up_ctr) {
+            payload.up = bytes[bytesIndex++];
+        }
+        if (statusInfo.dn_ctr) {
+            payload.dn = bytes[bytesIndex++];
+        }
+        if (statusInfo.battery) {
+            payload.battery = bytes[bytesIndex + 1] + (bytes[bytesIndex] << 8);
+            bytesIndex = bytesIndex + 2;
+        }
+
+        // Set signal info
+        if (statusInfo.rssiSnr) {
+            payload.devRssi = -bytes[bytesIndex++];
+            payload.devSnr = bytes[bytesIndex++];
+        }
+        setGatewaySignalInfo(payload, rxInfo);
+
+        // Assign payload props to the pre-ordered object
+        const orderedPayload = Object.assign(payloadOrder, payload);
+        // Remove null-values
+        const orderedPayloadDefined = Object.keys(orderedPayload)
+            .filter((k) => orderedPayload[k] != null)
+            .reduce((a, k) => ({ ...a, [k]: orderedPayload[k] }), {});
+
+        return orderedPayloadDefined;
+    }
+
+    function setTemperature(payload, temperatureIndex, arr, a) {
+        // Get temperature
+        payload.temperature =
+            (Bin2Dec(arr[temperatureIndex++]) ? -1 : 1) *
+            Bin2Dec(a.substr(temperatureIndex, 7));
+    }
+
+    return parsePayload();
+}
+
+function setGatewaySignalInfo(payload, rxInfo) {
+    if (Array.isArray(rxInfo)) {
+        // Take the package with highest RSSI
+        const maxPackage = rxInfo.reduce((res, info) => {
+            if (res === null) {
+                return info;
+            }
+
+            return res.rssi > info.rssi ? res : info;
+        }, null);
+        const maxRssi = maxPackage ? maxPackage.rssi : null;
+        const maxSnr = maxPackage ? maxPackage.loRaSNR : null;
+
+        payload.gwRssi = maxRssi;
+        payload.gwSnr = maxSnr;
+    }
+}
+
+function setGateways(payload, rxInfo) {
+    if (Array.isArray(rxInfo)) {
+        payload.allGatewayPackages = rxInfo.map((info) => ({
+            gatewayId: info.gatewayID,
+            rssi: info.rssi,
+            snr: info.loRaSNR,
+            location: info.location,
+        }));
+    }
+}
+
+// Converts the hex string to bytes
+function hexToBytes(hex) {
+    for (var bytes = [], c = 0; c < hex.length; c += 2)
+        bytes.push(parseInt(hex.substr(c, 2), 16));
+    return bytes;
+}
+
+// Converts the base64 string to a hex string
+function base64ToHex(str) {
+    const raw = atob(str);
+    let result = "";
+    for (let i = 0; i < raw.length; i++) {
+        const hex = raw.charCodeAt(i).toString(16);
+        result += hex.length === 2 ? hex : "0" + hex;
+    }
+    return result.toUpperCase();
+}
+
+// The required decode() method
+function decode(payload, metadata) {
+    // Convert base64 values to hex
+    let hexString = base64ToHex(payload.data);
+
+    // Convert hex values to bytes
+    let data = hexToBytes(hexString);
+
+    // Decode using the adeunis decoder
+    let res = {};
+
+    res.payload = adeunisDecoder(data, payload.rxInfo, undefined);
+    res.iitfDecoder = "Os2Passthrough";
+    res.deviceId = payload.devEUI;
+    res.metadata = metadata;
+
+    return res;
+}
